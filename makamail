@@ -1,0 +1,207 @@
+#!/usr/bin/env ruby
+
+require 'nokogiri'
+require 'uri'
+require 'tmpdir'
+require 'fileutils'
+require 'concurrent'
+require 'thread'
+
+#
+# Construct a mail from a document that contain images.
+#
+
+USAGE=<<EOS
+Construct a multipart electronic mail from the source document. Images are
+automaticaly resized and embedded and the document is rewritten accordingly.
+
+Usage: makamail -i SOURCE [-o OUTPUT] [arguments]
+
+Arguments:
+  -o OUTPUT             Write mail body to OUTPUT.
+  --from SENDER         Set the From header with SENDER.
+  --to RECIPIENT        Set the To header with RECIPIENT.
+  --subject SUBJECT     Set the Subject header with SUBJECT.
+  --header HEADER       Add the HEADER header.
+  --boundary BOUNDARY   Use BOUNDARY as multipart boundary.
+EOS
+
+input_file = nil
+output_file = nil
+root_dir = Dir.pwd
+boundary = "gc0p4Jq0M2Yt08jU534c0p".freeze
+headers = []
+log = STDERR
+
+
+def next_arg
+  if ARGV.empty?
+    STDERR.puts "Missing argument"
+    exit -1
+  end
+  ARGV.shift
+end
+
+until ARGV.empty?
+  arg = next_arg()
+  case arg
+  when "-i","--input"
+    input_file = next_arg()
+    root_dir = File.dirname(input_file)
+  when "-o","--output"
+    output_file = next_arg()
+  when "--from"
+    value = next_arg()
+    headers << ("From: %s" % [value])
+  when "--to"
+    value = next_arg()
+    headers << ("To: %s" % [value])
+  when "--subject"
+    value = next_arg()
+    headers << ("Subject: %s" % [value])
+  when "-h","--help"
+    STDOUT.puts USAGE
+    exit 0
+  else
+    STDERR.puts "Wrong argument: #{arg}"
+    exit -1
+  end
+end
+
+headers << 'MIME-Version: 1.0'
+headers << ('Content-Type: multipart/related;boundary="%s"' % [boundary])
+
+Dir.mktmpdir do |tmpdir|
+
+  case input_file
+  when /\.html?$/
+    # no conversion required
+  else
+    # convert with pandoc to html
+    log.puts "converting input file to HTML"
+    converted = File.join(tmpdir,"source.html")
+    `pandoc -s -t html -o #{converted} #{input_file}`
+    input_file = converted
+  end
+
+  # read source html
+  log.puts "reading HTML document"
+  source = Nokogiri::HTML(File.read(input_file))
+
+  # cid to content file path
+  parts = {}
+
+  ## replace inline image sources
+  log.puts "searching image sources"
+  imgs = source.search("//img")
+  log.puts "found #{imgs.size} image source(s)"
+  log.puts "processing image sources"
+  imgs.each do |img|
+    src = img.at_xpath("@src")
+    cid = "part-#{parts.size}"
+
+    parts[cid] = Concurrent::Future.execute do
+      content = src.value
+      if content.match?(/^data:([^;,]+)(;charset=[^;,]+)?(;base64)?,/)
+        mime_type=$1
+        is_base64=not($3.nil?)
+        raise "Must be base64" unless is_base64
+
+        log.puts "- inline image"
+
+        start_of_data = content.index(',') + 1
+        path = File.join(tmpdir,"#{cid}.b64")
+        File.write(path, content.slice(start_of_data..-1))
+        # replace inline content with content-id reference
+        src.value = "cid:#{cid}"
+        {filename: "#{cid}", path: path, mime_type: mime_type}
+      else
+        # must be an URI
+        uri = URI(content)
+        filename = File.basename(uri.path)
+        source_path = File.absolute_path(uri.path, root_dir)
+
+        mime_type = `file -b --mime-type #{source_path}`
+        log.puts "- linked image #{uri} MIME-Type: #{mime_type}"
+
+        binpath = source_path
+        path = File.join(tmpdir,"#{cid}.b64")
+
+        # read dimensions attributes
+        if w = img.at_xpath("@width")
+          width = w.value.to_i
+        end
+        if h = img.at_xpath("@height")
+          height = h.value.to_i
+        end
+
+        if width || height
+          # resize image if dimensions are given
+          log.puts "  resizing image with constraints: width:#{width} height:#{height}"
+          binpath = File.join(tmpdir, "#{cid}.bin")
+          if width && height
+            `convert #{source_path} -resize #{width}x#{height}\! #{binpath}`
+          elsif width
+            `convert #{source_path} -resize #{width}x #{binpath}`
+          elsif height
+            `convert #{source_path} -resize x#{height} #{binpath}`
+          end
+        end
+
+        # convert file to base64
+        log.puts "  converting image to base64"
+        `base64 #{binpath} > #{path}`
+
+        src.value = "cid:#{cid}"
+        {filename: filename, path: path, mime_type: mime_type}
+      end
+    end
+  end
+
+  # wait for all futures to be completed
+  parts.each do |cid,part|
+    part.value
+  end
+
+  if output_file.nil?
+    out = STDOUT
+  else
+    tmpout = File.join(tmpdir,"output.mail")
+    out = File.new(tmpout,"w+")
+  end
+
+  log.puts "generating mail content"
+
+  # HEADERS
+  headers.each do |header|
+    out.puts header
+  end
+  out.puts ""
+
+  ## HTML
+  out.puts "--#{boundary}"
+  out.puts "Content-Type: text/html; charset=UTF-8"
+  out.puts "Content-Transfer-Encoding: 7bit"
+  out.puts ""
+  out.write source
+
+  ## CONTENT PARTS
+  parts.each do |cid,part|
+    rec = part.value
+    out.puts ""
+    out.puts "--#{boundary}"
+    out.puts "Content-Type: #{rec[:mime_type]}"
+    out.puts "Content-Transfer-Encoding: base64"
+    out.puts "Content-ID: #{cid}"
+    out.puts "Content-Disposition: inline; filename=\"#{rec[:filename]}\""
+    out.puts ""
+    out.write(File.read(rec[:path]))
+  end
+
+  out.puts "--#{boundary}--"
+
+  unless output_file.nil?
+    out.close
+    FileUtils.cp(tmpout, output_file)
+  end
+end
