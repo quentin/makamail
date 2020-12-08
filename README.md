@@ -1,0 +1,6 @@
+
+# Dependencies
+- `ruby`
+- `pandoc`
+- `convert`
+
