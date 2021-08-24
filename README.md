@@ -2,5 +2,5 @@
 # Dependencies
 - `ruby`
 - `pandoc`
-- `convert`
+- `convert`, `identify` (from imagemagick)
 

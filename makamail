@@ -148,6 +148,15 @@ Dir.mktmpdir do |tmpdir|
           end
         end
 
+        if !width && !height
+          # impose dimensions
+          case `identify -format  "%[fx:w] %[fx:h]" #{source_path}`.chomp.split(' ')
+          in [w, h]
+            img['width'] = w
+            img['height'] = h
+          end
+        end
+
         # convert file to base64
         log.puts "  converting image to base64"
         `base64 #{binpath} > #{path}`
@@ -183,7 +192,7 @@ Dir.mktmpdir do |tmpdir|
   out.puts "Content-Type: text/html; charset=UTF-8"
   out.puts "Content-Transfer-Encoding: 7bit"
   out.puts ""
-  out.write source
+  out.write source.inner_html
 
   ## CONTENT PARTS
   parts.each do |cid,part|
